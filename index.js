@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const fs = require('fs');
 const path = require('path');
 const {
@@ -9,6 +11,15 @@ const {
 } = require('discord.js');
 
 const config = require('./config.json');
+const human = require('./human');
+
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+
+if (!DISCORD_TOKEN || !GROQ_API_KEY) {
+  console.error('Thiếu DISCORD_TOKEN hoặc GROQ_API_KEY trong file .env');
+  process.exit(1);
+}
 
 const DATA_DIR = path.join(__dirname, 'data');
 const CHANNELS_FILE = path.join(DATA_DIR, 'channels.json');
@@ -17,8 +28,7 @@ const TRAINING_FILE = path.join(DATA_DIR, 'training.jsonl');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// ---------- Lưu trữ ----------
-let channelStore = {}; // { guildId: [channelId, ...] }
+let channelStore = {};
 try {
   channelStore = JSON.parse(fs.readFileSync(CHANNELS_FILE, 'utf8'));
 } catch {
@@ -36,8 +46,7 @@ const appendJsonl = (file, obj) =>
 const isActiveChannel = (guildId, channelId) =>
   (channelStore[guildId] || []).includes(channelId);
 
-// ---------- Ngữ cảnh hội thoại theo channel ----------
-const contexts = new Map(); // channelId -> [{role, content}]
+const contexts = new Map();
 
 function getContext(channelId) {
   if (!contexts.has(channelId)) contexts.set(channelId, []);
@@ -50,13 +59,12 @@ function pushContext(channelId, msg) {
   while (ctx.length > config.maxHistory) ctx.shift();
 }
 
-// ---------- Groq API ----------
 async function askGroq(messages, attempt = 0) {
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.groqApiKey}`,
+      Authorization: `Bearer ${GROQ_API_KEY}`,
     },
     body: JSON.stringify({
       model: config.model,
@@ -81,7 +89,6 @@ async function askGroq(messages, attempt = 0) {
   return (data.choices?.[0]?.message?.content || '').trim();
 }
 
-// ---------- Tiện ích ----------
 function splitMessage(text, limit = 1900) {
   const chunks = [];
   let rest = text;
@@ -96,7 +103,6 @@ function splitMessage(text, limit = 1900) {
   return chunks;
 }
 
-// ---------- Discord client ----------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -105,6 +111,8 @@ const client = new Client({
   ],
   partials: [Partials.Channel],
 });
+
+require('./keep_alive')(client);
 
 const commands = [
   new SlashCommandBuilder()
@@ -136,7 +144,6 @@ client.once('clientReady', async () => {
 
 client.on('guildCreate', registerCommands);
 
-// ---------- Slash commands ----------
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (!interaction.guild) {
@@ -190,7 +197,6 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// ---------- Xử lý tin nhắn ----------
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
 
@@ -227,17 +233,22 @@ client.on('messageCreate', async (message) => {
   pushContext(channelId, { role: 'user', content: userText });
 
   try {
-    await message.channel.sendTyping().catch(() => {});
+    let answer = human.matchIntent(content);
+    const canned = answer !== null;
 
-    const payload = [
-      { role: 'system', content: config.systemPrompt },
-      ...getContext(channelId),
-    ];
-    const answer = await askGroq(payload);
+    if (!canned) {
+      await message.channel.sendTyping().catch(() => {});
+      answer = await askGroq([
+        { role: 'system', content: config.systemPrompt },
+        ...getContext(channelId),
+      ]);
+    }
 
     if (!answer) return;
 
-    pushContext(channelId, { role: 'assistant', content: answer });
+    const finalText = human.decorate(answer, content);
+
+    pushContext(channelId, { role: 'assistant', content: finalText });
 
     appendJsonl(HISTORY_FILE, {
       ts: new Date().toISOString(),
@@ -246,19 +257,19 @@ client.on('messageCreate', async (message) => {
       userId: client.user.id,
       username: client.user.username,
       role: 'assistant',
-      content: answer,
+      source: canned ? 'canned' : 'groq',
+      content: finalText,
     });
 
-    // Định dạng chuẩn để huấn luyện / fine-tune
     appendJsonl(TRAINING_FILE, {
       messages: [
         { role: 'system', content: config.systemPrompt },
         { role: 'user', content },
-        { role: 'assistant', content: answer },
+        { role: 'assistant', content: finalText },
       ],
     });
 
-    const chunks = splitMessage(answer);
+    const chunks = splitMessage(finalText);
     await message.reply({
       content: chunks[0],
       allowedMentions: { repliedUser: false, parse: [] },
@@ -277,5 +288,4 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-require('./keep_alive')(client);
-client.login(config.token);
+client.login(DISCORD_TOKEN);
